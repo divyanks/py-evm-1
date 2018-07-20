@@ -60,31 +60,62 @@ HeaderRequestingPeer = Union[LESPeer, ETHPeer]
 
 class HeaderRequest(NamedTuple):
     peer: HeaderRequestingPeer
-    block_number: int
+    block_number_or_hash: int
     max_headers: int
     skip: int
     reverse: bool
 
     def generate_block_numbers(self, block_number: int=None):
+        if block_number is None and not self.is_numbered:
+            raise TypeError(
+                "A `block_number` must be supplied to generate block numbers "
+                "for hash based header requests"
+            )
+        elif block_number is not None and self.is_numbered:
+            raise TypeError(
+                "The `block_number` parameter may not be used for number based "
+                "header requests"
+            )
+        elif block_number is None:
+            block_number = self.block_number
         return sequence_builder(
-            self.block_number,
+            block_number,
             self.max_headers,
             self.skip,
             self.reverse,
         )
 
+    @property
+    def is_numbered(self):
+        return isinstance(self.block_number_or_hash, int)
+
     def validate_headers(self, headers):
+        if not headers:
+            # empty response is always valid (TODO: deal with this)
+            return
+        elif not self.is_numbered:
+            first_header = headers[0]
+            if first_header.hash != self.block_number_or_hash:
+                raise ValidationError("TODO: mismatched first block hash")
+
         block_numbers = tuple(header.block_number for header in headers)
         return self.validate_sequence(block_numbers)
 
     def validate_sequence(self, block_numbers: Tuple[int]):
-        expected_numbers = self.generate_block_numbers()
-        unexpected_numbers = set(block_numbers).difference(expected_numbers)
+        if not block_numbers:
+            return
+        elif self.is_numbered:
+            expected_numbers = self.generate_block_numbers()
+        else:
+            expected_numbers = self.generate_block_numbers(block_numbers[0])
 
+        # check for numbers that should not be present.
+        unexpected_numbers = set(block_numbers).difference(expected_numbers)
         if unexpected_numbers:
             raise ValidationError(
                 'Unexpected numbers: {0}'.format(unexpected_numbers))
 
+        # check that the numbers are correctly ordered.
         expected_order = tuple(sorted(
             block_numbers,
             reverse=self.reverse,
@@ -92,8 +123,9 @@ class HeaderRequest(NamedTuple):
         if block_numbers != expected_order:
             raise ValidationError('Invalid ordering')
 
+        # check that all provided numbers are an ordered subset of the master
+        # sequence.
         iter_expected = iter(expected_numbers)
-
         for number in block_numbers:
             for value in iter_expected:
                 if value == number:
@@ -102,8 +134,12 @@ class HeaderRequest(NamedTuple):
                 raise ValidationError('Unmatched number')
 
     def is_valid_headers(self, headers):
-        block_numbers = tuple(header.block_number for header in headers)
-        return self.is_valid_sequence(block_numbers)
+        try:
+            self.validate_headers(headers)
+        except ValidationError:
+            return False
+        else:
+            return True
 
     def is_valid_sequence(self, block_numbers: Tuple[int]):
         try:
