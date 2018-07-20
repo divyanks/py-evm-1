@@ -58,6 +58,62 @@ if TYPE_CHECKING:
 HeaderRequestingPeer = Union[LESPeer, ETHPeer]
 
 
+class HeaderRequest(NamedTuple):
+    peer: HeaderRequestingPeer
+    block_number: int
+    max_headers: int
+    skip: int
+    reverse: bool
+
+    def generate_block_numbers(self, block_number: int=None):
+        return sequence_builder(
+            self.block_number,
+            self.max_headers,
+            self.skip,
+            self.reverse,
+        )
+
+    def validate_headers(self, headers):
+        block_numbers = tuple(header.block_number for header in headers)
+        return self.validate_sequence(block_numbers)
+
+    def validate_sequence(self, block_numbers: Tuple[int]):
+        expected_numbers = self.generate_block_numbers()
+        unexpected_numbers = set(block_numbers).difference(expected_numbers)
+
+        if unexpected_numbers:
+            raise ValidationError(
+                'Unexpected numbers: {0}'.format(unexpected_numbers))
+
+        expected_order = tuple(sorted(
+            block_numbers,
+            reverse=self.reverse,
+        ))
+        if block_numbers != expected_order:
+            raise ValidationError('Invalid ordering')
+
+        iter_expected = iter(expected_numbers)
+
+        for number in block_numbers:
+            for value in iter_expected:
+                if value == number:
+                    break
+            else:
+                raise ValidationError('Unmatched number')
+
+    def is_valid_headers(self, headers):
+        block_numbers = tuple(header.block_number for header in headers)
+        return self.is_valid_sequence(block_numbers)
+
+    def is_valid_sequence(self, block_numbers: Tuple[int]):
+        try:
+            self.validate_sequence(block_numbers)
+        except ValidationError:
+            return False
+        else:
+            return True
+
+
 class BaseHeaderChainSyncer(BaseService, PeerPoolSubscriber):
     """
     Sync with the Ethereum network by fetching/storing block headers.
@@ -192,6 +248,10 @@ class BaseHeaderChainSyncer(BaseService, PeerPoolSubscriber):
                 self.logger.warn("Timeout waiting for header batch from %s, aborting sync", peer)
                 await peer.disconnect(DisconnectReason.timeout)
                 break
+            except ValidationError:
+                self.logger.warn("Invalid header response sent by peer.")
+                await peer.disconnect(DisconnectReason.useless_peer)
+                break
 
             if not headers:
                 self.logger.info("Got no new headers from %s, aborting sync", peer)
@@ -236,12 +296,19 @@ class BaseHeaderChainSyncer(BaseService, PeerPoolSubscriber):
         """Fetch a batch of headers starting at start_at and return the ones we're missing."""
         self.logger.debug("Fetching chain segment starting at #%d", start_at)
         peer.request_block_headers(start_at, peer.max_headers_fetch, reverse=False)
+
         # Pass the peer's token to self.wait() because we want to abort if either we
         # or the peer terminates.
         headers = list(await self.wait(
             self._new_headers.get(),
             token=peer.cancel_token,
             timeout=self._reply_timeout))
+
+        # check that the response headers are a valid match for our
+        # requested headers.
+        header_request = HeaderRequest(peer, start_at, peer.max_headers_fetch, 0, False)
+        header_request.validate_headers(headers)
+
         for header in headers.copy():
             try:
                 await self.wait(self.db.coro_get_block_header_by_hash(header.hash))
